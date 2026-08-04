@@ -537,6 +537,7 @@ public final class CraftPlannerV2<K> {
         // Returned catalysts must be acquired before the firing's outputs enter the shared pool.
         // The recursive path already has that execution order; the aggregate linear pass does not,
         // so using it here could let a positive macro output bootstrap its own seed algebraically.
+        CraftPlan<K> linearDiagnosis = null;
         if (!requiresSeedOrderedPlanning) {
             // 1) Linear backbone (v2-memo-deps / v2-lazy-deduct): one topological aggregation pass,
             //    each item resolved exactly once = O(n + E). Reservation-based capacity gives O(1)
@@ -547,9 +548,21 @@ public final class CraftPlannerV2<K> {
             if (linear.feasible()) {
                 return enforceCycleBootstrap(linear);
             }
+            // Infeasible, but on a route-unique graph with no pool-order-sensitive inputs the
+            // recursive search could only re-walk the same unique route. Its expansion is per
+            // parent-edge rather than aggregated per item, so a compression DAG (each tier built
+            // from lower tiers, demands multiplying downward) costs work proportional to the leaf
+            // DEMAND, not the graph; the exhausted-budget tail then stops descending and reports
+            // craftable intermediates as missing. The aggregate pass already proved the exact
+            // shortfall at the true leaves, so return that diagnosis directly.
+            if (recursiveSearchCannotImprove()) {
+                return enforceCycleBootstrap(linear);
+            }
+            linearDiagnosis = linear;
         }
 
-        // 2) Contended cone only: fall back to the budgeted recursive search (trail + rollback).
+        // 2) Contended/order-sensitive cone: fall back to the budgeted recursive search
+        //    (trail + rollback).
         for (K x : items) {
             stockLeft.put(x, graph.stock(x));
         }
@@ -565,7 +578,101 @@ public final class CraftPlannerV2<K> {
                 new HashMap<>(grossDemand),
                 processed,
                 searchBudget.exhausted() && !feasible);
-        return enforceCycleBootstrap(fallback);
+        CraftPlan<K> committed = enforceCycleBootstrap(fallback);
+        if (committed.feasible()) {
+            return committed;
+        }
+        // Seed-ordered cones skip the aggregate pass above: without execution order it can neither
+        // prove feasibility (a positive macro output could algebraically bootstrap its own seed)
+        // nor express the fail-closed seed semantics of a complete search (a seed whose bootstrap
+        // cannot run is deliberately reported missing itself). A COMPLETE search diagnosis
+        // therefore stands as-is. Only when the search ran out of budget — its tail then lists
+        // whatever craftable intermediates it was standing on — is the aggregate result computed
+        // lazily as a competing diagnosis, so a compression sub-DAG inside a loop cone degrades to
+        // exact leaves instead of that tail.
+        if (linearDiagnosis == null && requiresSeedOrderedPlanning && committed.budgetExhausted()) {
+            long linearStarted = System.nanoTime();
+            CraftPlan<K> linear = linearPass(order, target, amount);
+            diagnostics.addLinearPassNanos(System.nanoTime() - linearStarted);
+            if (!linear.feasible()) {
+                linearDiagnosis = linear;
+            }
+        }
+        if (linearDiagnosis == null) {
+            return committed;
+        }
+        // 3) Both diagnoses are concrete mass-balanced best-effort plans; prefer the one that asks
+        //    the player to replenish fewer kinds/units (the same heuristic planDetailed applies
+        //    across route variants). This matters most when the search budget ran out mid-descent
+        //    and the committed tail listed craftable intermediates instead of raw leaves. Budget
+        //    exhaustion is a fact about the search, not the chosen diagnosis, so the flag carries
+        //    over to keep planDetailed's stop-exploring semantics.
+        CraftPlan<K> aggregate = enforceCycleBootstrap(linearDiagnosis);
+        CraftPlan<K> better = betterIncompletePlan(committed, aggregate);
+        if (better == committed) {
+            return committed;
+        }
+        return committed.budgetExhausted() ? markBudgetExhausted(better) : better;
+    }
+
+    /**
+     * True when the budgeted recursive search provably cannot outperform the aggregate linear pass,
+     * so an infeasible linear plan is already the exact best-effort diagnosis. This holds when every
+     * mechanism the search adds over per-item aggregation is absent from the reachable (post-cut)
+     * graph:
+     *
+     * <ul>
+     *   <li>no item has more than one usable recipe (nothing to backtrack between; note a cut
+     *       back-edge may hide an alternative, but that alternative is only reachable under another
+     *       cycle orientation, which {@code planDetailed} explores as its own variant);</li>
+     *   <li>no feedback-seed bootstraps/converters and no suppressed positive-feedback outputs
+     *       (their reservation/startup accounting exists only on the recursive path);</li>
+     *   <li>no returned (catalyst) or host-backed reusable inputs: the recursive path hands a
+     *       returned seed back into the shared pool where later ordinary demands may reuse it,
+     *       which the linear seed-reserve model deliberately does not;</li>
+     *   <li>no reachable pattern consumes a key that some reachable pattern emits as a byproduct or
+     *       container remainder: byproduct reuse depends on execution order, and the DFS order of
+     *       the recursive path can credit a byproduct to a consumer the fixed topological order of
+     *       the linear pass visits too early.</li>
+     * </ul>
+     *
+     * <p>Everything here reads {@code patternsByOutput}, which is rebuilt from the prepared graph on
+     * replays, so the decision is identical for the first run and every variant replay.
+     */
+    private boolean recursiveSearchCannotImprove() {
+        if (!feedbackSeedBootstraps.isEmpty()
+                || !feedbackSeedConverters.isEmpty()
+                || !suppressedPositiveFeedbackOutputs.isEmpty()) {
+            return false;
+        }
+        Set<K> byproductKeys = new HashSet<>();
+        for (List<CraftPattern<K>> patterns : patternsByOutput.values()) {
+            if (patterns.size() > 1) {
+                return false;
+            }
+            for (CraftPattern<K> pattern : patterns) {
+                for (CraftOutput<K> byproduct : pattern.byproducts()) {
+                    byproductKeys.add(byproduct.key());
+                }
+                for (CraftInput<K> input : pattern.inputs()) {
+                    if (input.remainder() != null) {
+                        byproductKeys.add(input.remainder());
+                    }
+                }
+            }
+        }
+        for (List<CraftPattern<K>> patterns : patternsByOutput.values()) {
+            for (CraftPattern<K> pattern : patterns) {
+                for (CraftInput<K> input : pattern.inputs()) {
+                    if (input.returned()
+                            || input.reusableStockSource() != null
+                            || byproductKeys.contains(input.key())) {
+                        return false;
+                    }
+                }
+            }
+        }
+        return true;
     }
 
     private PreparedGraph<K> snapshotPreparedGraph(List<K> order, Set<K> items) {

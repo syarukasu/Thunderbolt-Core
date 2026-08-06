@@ -2,9 +2,15 @@ package com.moakiee.thunderbolt;
 
 import com.mojang.logging.LogUtils;
 import com.moakiee.thunderbolt.api.eject.EjectCapabilityRegistry;
+import com.moakiee.thunderbolt.api.crafting.CraftingPlanningEngines;
+import com.moakiee.thunderbolt.api.crafting.ICraftingPlanningService;
 import com.moakiee.thunderbolt.ae2.cell.IndexedCellStorageRegistry;
 import com.moakiee.thunderbolt.ae2.cell.IndexedStorageCellHandler;
+import com.moakiee.thunderbolt.ae2.crafting.CraftingPlanningService;
+import com.moakiee.thunderbolt.ae2.crafting.ThunderboltV2PlanningEngine;
 import com.moakiee.thunderbolt.registry.ThunderboltBlockEntities;
+import com.moakiee.thunderbolt.registry.ThunderboltMenus;
+import appeng.api.networking.GridServices;
 import appeng.api.storage.StorageCells;
 import net.neoforged.bus.api.IEventBus;
 import net.neoforged.fml.event.lifecycle.FMLCommonSetupEvent;
@@ -29,6 +35,7 @@ public final class ThunderboltCore {
 
     public ThunderboltCore(IEventBus modEventBus) {
         ThunderboltBlockEntities.TYPES.register(modEventBus);
+        ThunderboltMenus.TYPES.register(modEventBus);
         modEventBus.addListener(this::onCommonSetup);
         NeoForge.EVENT_BUS.addListener(this::onServerStarting);
         NeoForge.EVENT_BUS.addListener(this::onServerStopped);
@@ -45,6 +52,11 @@ public final class ThunderboltCore {
     }
 
     private void onCommonSetup(FMLCommonSetupEvent event) {
-        event.enqueueWork(() -> StorageCells.addCellHandler(IndexedStorageCellHandler.INSTANCE));
+        event.enqueueWork(() -> {
+            StorageCells.addCellHandler(IndexedStorageCellHandler.INSTANCE);
+            GridServices.register(ICraftingPlanningService.class, CraftingPlanningService.class);
+            CraftingPlanningEngines.register(
+                    ThunderboltV2PlanningEngine.INSTANCE, 1_000, true);
+        });
     }
 }

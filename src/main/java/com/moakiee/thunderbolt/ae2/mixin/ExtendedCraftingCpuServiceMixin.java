@@ -47,7 +47,9 @@ import com.moakiee.thunderbolt.ae2.crafting.DynamicCraftingCpuClusterIndex;
 import com.moakiee.thunderbolt.ae2.crafting.ExtendedCraftingCpuCluster;
 import com.moakiee.thunderbolt.ae2.crafting.ExtendedCraftingCpuClusterProvider;
 import com.moakiee.thunderbolt.ae2.crafting.FastCraftingControl;
+import com.moakiee.thunderbolt.ae2.crafting.CraftingPlanningControl;
 import com.moakiee.thunderbolt.ae2.crafting.LoopCraftingPlan;
+import com.moakiee.thunderbolt.api.crafting.ICraftingPlanningService;
 
 @Mixin(value = CraftingService.class, remap = false)
 public abstract class ExtendedCraftingCpuServiceMixin {
@@ -89,17 +91,16 @@ public abstract class ExtendedCraftingCpuServiceMixin {
                     value = "INVOKE",
                     target = "Ljava/util/concurrent/ExecutorService;submit(Ljava/util/concurrent/Callable;)Ljava/util/concurrent/Future;",
                     shift = At.Shift.BEFORE))
-    private void thunderbolt$enableFastPlanningForTimeWheelCpu(Level level,
+    private void thunderbolt$configurePlanningSelection(Level level,
                                                                ICraftingSimulationRequester simRequester,
                                                                AEKey what,
                                                                long amount,
                                                                CalculationStrategy strategy,
                                                                CallbackInfoReturnable<Future<ICraftingPlan>> cir,
                                                                @Local CraftingCalculation job) {
-        thunderbolt$refreshExtendedCpuClusters();
-        boolean enabled = thunderbolt$getExtendedCpuClusters().stream()
-                .anyMatch(cluster -> cluster.isActive() && cluster.isFastPlanningEnabled());
-        ((FastCraftingControl) job).ae2lt$setFastPlanningEnabled(enabled);
+        var planning = grid.getService(ICraftingPlanningService.class);
+        ((CraftingPlanningControl) job).thunderbolt$configurePlanning(
+                planning.resolve(), strategy);
     }
 
     @Inject(

@@ -1,11 +1,11 @@
 package com.moakiee.thunderbolt.ae2.mixin;
 
-import java.util.IdentityHashMap;
-import java.util.Map;
+import java.util.List;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.TimeUnit;
 
 import org.jetbrains.annotations.Nullable;
+import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.Unique;
@@ -13,75 +13,80 @@ import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
-import appeng.api.networking.crafting.ICraftingSimulationRequester;
+import appeng.api.networking.IGrid;
+import appeng.api.networking.crafting.CalculationStrategy;
 import appeng.api.networking.crafting.ICraftingPlan;
+import appeng.api.networking.crafting.ICraftingSimulationRequester;
 import appeng.api.stacks.AEKey;
 import appeng.crafting.CraftingCalculation;
 import appeng.crafting.CraftingPlan;
 import appeng.crafting.inv.NetworkCraftingSimulationState;
 
 import com.moakiee.thunderbolt.ThunderboltCore;
+import com.moakiee.thunderbolt.ae2.crafting.CraftingPlanningControl;
 import com.moakiee.thunderbolt.ae2.crafting.FastCraftingControl;
-import com.moakiee.thunderbolt.ae2.crafting.FastCraftingPlanner;
 import com.moakiee.thunderbolt.ae2.crafting.FastPlanningWatchdog;
-import com.moakiee.thunderbolt.ae2.crafting.LoopCraftingPlan;
-import com.moakiee.thunderbolt.core.planner.ReusableStockUsageKey;
+import com.moakiee.thunderbolt.ae2.crafting.ThunderboltV2PlanningEngine;
+import com.moakiee.thunderbolt.api.crafting.CraftingPlanningEngines;
+import com.moakiee.thunderbolt.api.crafting.PlanningAttempt;
+import com.moakiee.thunderbolt.api.crafting.PlanningChoice;
+import com.moakiee.thunderbolt.api.crafting.PlanningEngineSession;
+import com.moakiee.thunderbolt.api.crafting.PlanningRequest;
 
-/**
- * Installs the linear-time autocrafting fast path inside AE2's per-amount attempt
- * ({@code CraftingCalculation#runCraftAttempt(boolean, long)}).
- *
- * <p>By hooking the per-amount attempt instead of {@code computePlan}, AE2 keeps driving its own
- * strategy and binary-search loop (no need to reimplement CRAFT_LESS); we only replace the expensive
- * tree simulation of each attempt. The planner is best-effort and never falls back to AE2's exhaustive
- * simulator (Policy A) — that quadratic/NBT-fuzzy path is exactly what hangs on heavy graphs.
- *
- * <p>Gating: the crafting-service extension explicitly enables this optimization for a fresh
- * calculation when at least one active time-wheel cluster is registered. The calculation itself does
- * not expose or consult any per-CPU/UI toggle. Closed-loop results are wrapped in a
- * {@link LoopCraftingPlan} before leaving the calculation.
- *
- * <p>Every attempt is wrapped by {@link FastPlanningWatchdog} so a hang is captured with a live stack.
- */
+/** Selects and locks one planning engine for the complete AE2 CraftingCalculation. */
 @Mixin(value = CraftingCalculation.class, remap = false)
-public abstract class CraftingCalculationMixin implements FastCraftingControl {
-
+public abstract class CraftingCalculationMixin implements CraftingPlanningControl, FastCraftingControl {
     @Shadow
+    @Final
     private NetworkCraftingSimulationState networkInv;
 
     @Shadow
+    @Final
     private AEKey output;
 
     @Shadow
+    @Final
+    private long requestedAmount;
+
+    @Shadow
+    @Final
+    private CalculationStrategy strategy;
+
+    @Shadow
+    @Final
     ICraftingSimulationRequester simRequester;
 
     @Shadow
     private boolean simulate;
 
     @Shadow
-    private long requestedAmount;
-
-    @Shadow
     abstract net.minecraft.world.level.Level getLevel();
 
     @Unique
-    private boolean ae2lt$fastPlanningInitialized;
-
-    @Unique
-    private boolean ae2lt$fastPlanningEnabled;
+    private List<PlanningChoice> thunderbolt$candidates = List.of(PlanningChoice.VANILLA);
 
     @Unique
     @Nullable
-    private Map<CraftingPlan, Map<ReusableStockUsageKey<AEKey>, Long>>
-            thunderbolt$reusableStockByAttempt;
+    private IGrid thunderbolt$grid;
+
+    @Unique
+    @Nullable
+    private PlanningRequest thunderbolt$request;
+
+    @Unique
+    @Nullable
+    private PlanningEngineSession thunderbolt$selectedSession;
+
+    @Unique
+    @Nullable
+    private net.minecraft.resources.ResourceLocation thunderbolt$selectedEngine;
+
+    @Unique
+    private boolean thunderbolt$selectedVanilla;
 
     @Unique
     @Nullable
     private CraftingPlan thunderbolt$cachedFullSimulationPlan;
-
-    @Unique
-    private Map<ReusableStockUsageKey<AEKey>, Long>
-            thunderbolt$cachedFullSimulationReusableStock = Map.of();
 
     @Unique
     private long thunderbolt$calculationStartedNanos;
@@ -90,163 +95,191 @@ public abstract class CraftingCalculationMixin implements FastCraftingControl {
     private int thunderbolt$attempts;
 
     @Unique
-    private int thunderbolt$fastHandledAttempts;
+    private int thunderbolt$handledAttempts;
 
     @Unique
-    private int thunderbolt$fastFallbackAttempts;
-
-    @Unique
-    private int thunderbolt$cachedSimulationAttempts;
-
-    @Unique
-    private int thunderbolt$fastFailures;
-
-    @Unique
-    @Nullable
-    private FastCraftingPlanner.CalculationSession thunderbolt$planningSession;
+    private int thunderbolt$declinedEngines;
 
     @Override
+    public void thunderbolt$configurePlanning(
+            List<PlanningChoice> candidates, CalculationStrategy ignoredStrategy) {
+        if (candidates == null || candidates.isEmpty()
+                || candidates.getLast().kind() != PlanningChoice.Kind.VANILLA) {
+            throw new IllegalArgumentException("Resolved planning candidates must end in VANILLA");
+        }
+        this.thunderbolt$candidates = List.copyOf(candidates);
+    }
+
+    /** Compatibility bridge for hosts compiled against the old boolean hook. */
+    @Override
     public void ae2lt$setFastPlanningEnabled(boolean enabled) {
-        this.ae2lt$fastPlanningInitialized = true;
-        this.ae2lt$fastPlanningEnabled = enabled;
+        thunderbolt$candidates = enabled
+                ? List.of(PlanningChoice.engine(ThunderboltV2PlanningEngine.ID), PlanningChoice.VANILLA)
+                : List.of(PlanningChoice.VANILLA);
     }
 
     @Override
     public boolean ae2lt$isFastPlanningEnabled() {
-        return this.ae2lt$fastPlanningInitialized && this.ae2lt$fastPlanningEnabled;
+        return thunderbolt$candidates.stream().anyMatch(choice ->
+                choice.kind() == PlanningChoice.Kind.ENGINE
+                        && ThunderboltV2PlanningEngine.ID.equals(choice.engineId()));
     }
 
     @Inject(method = "run", at = @At("HEAD"), remap = false)
-    private void thunderbolt$startCalculationTiming(CallbackInfoReturnable<ICraftingPlan> cir) {
+    private void thunderbolt$startCalculation(CallbackInfoReturnable<ICraftingPlan> cir) {
         thunderbolt$calculationStartedNanos = System.nanoTime();
         thunderbolt$attempts = 0;
-        thunderbolt$fastHandledAttempts = 0;
-        thunderbolt$fastFallbackAttempts = 0;
-        thunderbolt$cachedSimulationAttempts = 0;
-        thunderbolt$fastFailures = 0;
-        thunderbolt$planningSession = ae2lt$isFastPlanningEnabled()
-                ? new FastCraftingPlanner.CalculationSession()
-                : null;
+        thunderbolt$handledAttempts = 0;
+        thunderbolt$declinedEngines = 0;
+        thunderbolt$selectedSession = null;
+        thunderbolt$selectedEngine = null;
+        thunderbolt$selectedVanilla = false;
+        thunderbolt$cachedFullSimulationPlan = null;
+
+        var node = simRequester.getGridNode();
+        if (node != null) {
+            thunderbolt$grid = node.getGrid();
+            thunderbolt$request = new PlanningRequest(
+                    getLevel(), thunderbolt$grid.getCraftingService(), networkInv, output,
+                    requestedAmount, strategy, simRequester, null);
+        } else {
+            thunderbolt$grid = null;
+            thunderbolt$request = null;
+            thunderbolt$candidates = List.of(PlanningChoice.VANILLA);
+        }
         ThunderboltCore.LOGGER.info(
-                "[Thunderbolt Core][crafting-timing] started: output={} requested={} fastEnabled={}",
-                output, requestedAmount, ae2lt$isFastPlanningEnabled());
+                "[Thunderbolt Core][crafting-planner] started: output={} requested={} candidates={}",
+                output, requestedAmount, thunderbolt$candidates);
     }
 
     @Inject(method = "run", at = @At("RETURN"), cancellable = true, remap = false)
-    private void thunderbolt$wrapLoopPlan(CallbackInfoReturnable<ICraftingPlan> cir) {
+    private void thunderbolt$finishCalculation(CallbackInfoReturnable<ICraftingPlan> cir) {
         var result = cir.getReturnValue();
-        var reusableStockByAttempt = thunderbolt$getReusableStockByAttempt();
-        Map<ReusableStockUsageKey<AEKey>, Long> usedReusableStock = null;
-        if (result instanceof CraftingPlan craftingPlan) {
-            usedReusableStock = reusableStockByAttempt.get(craftingPlan);
+        if (thunderbolt$selectedSession != null) {
+            result = thunderbolt$selectedSession.finish(result);
+            cir.setReturnValue(result);
         }
-        cir.setReturnValue(LoopCraftingPlan.wrapIfNeeded(result, usedReusableStock));
-        reusableStockByAttempt.clear();
-        thunderbolt$clearSimulationFallback();
-        long elapsedNanos = thunderbolt$calculationStartedNanos == 0L
-                ? 0L
-                : Math.max(0L, System.nanoTime() - thunderbolt$calculationStartedNanos);
-        double wallMs = TimeUnit.NANOSECONDS.toMicros(elapsedNanos) / 1_000.0D;
+        double wallMs = TimeUnit.NANOSECONDS.toMicros(Math.max(
+                0L, System.nanoTime() - thunderbolt$calculationStartedNanos)) / 1_000.0D;
         ThunderboltCore.LOGGER.info(
-                "[Thunderbolt Core][crafting-timing] finished: output={} requested={} wallMs={} "
-                        + "fastEnabled={} attempts={} fastHandled={} fastFallback={} cachedSimulation={} "
-                        + "fastFailures={} result={}",
-                output, requestedAmount, wallMs, ae2lt$isFastPlanningEnabled(), thunderbolt$attempts,
-                thunderbolt$fastHandledAttempts, thunderbolt$fastFallbackAttempts,
-                thunderbolt$cachedSimulationAttempts, thunderbolt$fastFailures,
+                "[Thunderbolt Core][crafting-planner] finished: output={} requested={} wallMs={} "
+                        + "selected={} attempts={} handled={} declinedEngines={} result={}",
+                output, requestedAmount, wallMs,
+                thunderbolt$selectedVanilla ? "vanilla" : thunderbolt$selectedEngine,
+                thunderbolt$attempts, thunderbolt$handledAttempts, thunderbolt$declinedEngines,
                 result == null ? "null" : result.getClass().getSimpleName());
-        thunderbolt$calculationStartedNanos = 0L;
-        thunderbolt$planningSession = null;
+        thunderbolt$selectedSession = null;
+        thunderbolt$request = null;
+        thunderbolt$grid = null;
+        thunderbolt$cachedFullSimulationPlan = null;
     }
 
     @Inject(method = "runCraftAttempt", at = @At("HEAD"), cancellable = true, remap = false)
-    private void ae2ltCore$fastAttempt(boolean simulate, long amount,
-                                       CallbackInfoReturnable<CraftingPlan> cir) {
+    private void thunderbolt$planAttempt(
+            boolean simulate, long amount, CallbackInfoReturnable<CraftingPlan> cir) {
         thunderbolt$attempts++;
-        if (!ae2lt$isFastPlanningEnabled()) {
-            return;
-        }
-        if (simulate
-                && amount == requestedAmount
-                && thunderbolt$cachedFullSimulationPlan != null) {
-            thunderbolt$fastHandledAttempts++;
-            thunderbolt$cachedSimulationAttempts++;
+        if (simulate && amount == requestedAmount && thunderbolt$cachedFullSimulationPlan != null) {
             this.simulate = true;
-            thunderbolt$getReusableStockByAttempt().put(
-                    thunderbolt$cachedFullSimulationPlan,
-                    thunderbolt$cachedFullSimulationReusableStock);
-            cir.setReturnValue(thunderbolt$cachedFullSimulationPlan);
-            thunderbolt$clearSimulationFallback();
+            thunderbolt$handledAttempts++;
+            var cached = thunderbolt$cachedFullSimulationPlan;
+            thunderbolt$cachedFullSimulationPlan = null;
+            cir.setReturnValue(cached);
             return;
         }
-        var gridNode = simRequester.getGridNode();
-        if (gridNode == null) {
-            thunderbolt$fastFallbackAttempts++;
+        if (thunderbolt$selectedVanilla) {
             return;
         }
-        var craftingService = gridNode.getGrid().getCraftingService();
-        if (thunderbolt$planningSession == null) {
-            thunderbolt$planningSession = new FastCraftingPlanner.CalculationSession();
+        if (thunderbolt$selectedSession != null) {
+            PlanningAttempt attempt = thunderbolt$invokeSelected(amount, simulate);
+            if (attempt.status() == PlanningAttempt.Status.DECLINE) {
+                throw new IllegalStateException("Selected planning engine " + thunderbolt$selectedEngine
+                        + " declined a later probe in the same calculation");
+            }
+            thunderbolt$handle(attempt, simulate, amount, cir);
+            return;
+        }
+        if (thunderbolt$grid == null || thunderbolt$request == null) {
+            thunderbolt$selectedVanilla = true;
+            return;
         }
 
-        FastPlanningWatchdog.start(
-                "output=" + this.output + " requested=" + amount + " simulate=" + simulate + " engine=thunderbolt");
-        try {
-            var attempt = FastCraftingPlanner.tryAttempt(
-                    craftingService, networkInv, getLevel(), output, amount, simulate,
-                    simRequester instanceof com.moakiee.thunderbolt.ae2.crafting.ReservedStockCraftingRequester reserved
-                            ? reserved : null,
-                    thunderbolt$planningSession);
-            if (attempt.handled()) {
-                thunderbolt$fastHandledAttempts++;
-                // Reproduce the side effect of the real method body we are skipping, so that
-                // CraftingCalculation#isSimulation() reflects the attempt that produced this plan.
-                this.simulate = simulate;
-                if (!simulate
-                        && amount == requestedAmount
-                        && attempt.simulationFallback() != null) {
-                    thunderbolt$cachedFullSimulationPlan = attempt.simulationFallback();
-                    thunderbolt$cachedFullSimulationReusableStock = attempt.usedReusableStock();
-                }
-                if (attempt.plan() != null) {
-                    thunderbolt$getReusableStockByAttempt().put(
-                            attempt.plan(), attempt.usedReusableStock());
-                }
-                cir.setReturnValue(attempt.plan());
-            } else {
-                thunderbolt$fastFallbackAttempts++;
+        for (var choice : thunderbolt$candidates) {
+            if (choice.kind() == PlanningChoice.Kind.VANILLA) {
+                thunderbolt$selectedVanilla = true;
+                return;
             }
-        } catch (CancellationException cancelled) {
-            // The future was cancelled or the calculating thread was interrupted. Propagate that
-            // signal; falling through to AE2's slower simulator would defeat cooperative cancellation.
-            throw cancelled;
-        } catch (RuntimeException t) {
-            thunderbolt$fastFailures++;
-            thunderbolt$fastFallbackAttempts++;
-            thunderbolt$planningSession = null;
-            // Never let the optimization break a craft: fall back to AE2. Log at WARN with full context
-            // so an unexpected fast-path failure is easy to pinpoint instead of silently degrading.
-            // Fatal VM errors are deliberately not swallowed and followed by another expensive plan.
-            ThunderboltCore.LOGGER.warn(
-                "[Thunderbolt Core] fast path threw, falling back to AE2: output={} amount={} simulate={}",
-                output, amount, simulate, t);
+            if (choice.kind() != PlanningChoice.Kind.ENGINE) {
+                continue;
+            }
+            var engine = CraftingPlanningEngines.get(choice.engineId());
+            if (engine == null) {
+                thunderbolt$declinedEngines++;
+                continue;
+            }
+            try {
+                if (!engine.check(thunderbolt$grid, thunderbolt$request)) {
+                    thunderbolt$declinedEngines++;
+                    continue;
+                }
+                var candidateSession = engine.createSession(thunderbolt$grid, thunderbolt$request);
+                PlanningAttempt attempt = thunderbolt$invoke(
+                        choice.engineId(), candidateSession, amount, simulate);
+                if (attempt.status() == PlanningAttempt.Status.DECLINE) {
+                    thunderbolt$declinedEngines++;
+                    continue;
+                }
+                // The first HANDLED result locks this engine for every subsequent amount probe.
+                thunderbolt$selectedEngine = choice.engineId();
+                thunderbolt$selectedSession = candidateSession;
+                thunderbolt$handle(attempt, simulate, amount, cir);
+                return;
+            } catch (CancellationException cancelled) {
+                throw cancelled;
+            } catch (RuntimeException failure) {
+                thunderbolt$declinedEngines++;
+                ThunderboltCore.LOGGER.warn(
+                        "[Thunderbolt Core] planning engine failed before selection; trying next: "
+                                + "engine={} output={} amount={} simulate={}",
+                        choice.engineId(), output, amount, simulate, failure);
+            }
+        }
+        // Defensive fallback for a malformed third-party resolver. Normal resolution always includes it.
+        thunderbolt$selectedVanilla = true;
+    }
+
+    @Unique
+    private PlanningAttempt thunderbolt$invokeSelected(long amount, boolean simulate) {
+        return thunderbolt$invoke(
+                thunderbolt$selectedEngine, thunderbolt$selectedSession, amount, simulate);
+    }
+
+    @Unique
+    private PlanningAttempt thunderbolt$invoke(
+            net.minecraft.resources.ResourceLocation engineId,
+            PlanningEngineSession session,
+            long amount,
+            boolean simulate) {
+        FastPlanningWatchdog.start(
+                "output=" + output + " requested=" + amount + " simulate=" + simulate
+                        + " engine=" + engineId);
+        try {
+            return session.attempt(amount, simulate);
         } finally {
             FastPlanningWatchdog.stop();
         }
     }
 
     @Unique
-    private Map<CraftingPlan, Map<ReusableStockUsageKey<AEKey>, Long>>
-            thunderbolt$getReusableStockByAttempt() {
-        if (this.thunderbolt$reusableStockByAttempt == null) {
-            this.thunderbolt$reusableStockByAttempt = new IdentityHashMap<>();
+    private void thunderbolt$handle(
+            PlanningAttempt attempt,
+            boolean simulate,
+            long amount,
+            CallbackInfoReturnable<CraftingPlan> cir) {
+        thunderbolt$handledAttempts++;
+        this.simulate = simulate;
+        if (!simulate && amount == requestedAmount && attempt.simulationFallback() != null) {
+            thunderbolt$cachedFullSimulationPlan = attempt.simulationFallback();
         }
-        return this.thunderbolt$reusableStockByAttempt;
-    }
-
-    @Unique
-    private void thunderbolt$clearSimulationFallback() {
-        thunderbolt$cachedFullSimulationPlan = null;
-        thunderbolt$cachedFullSimulationReusableStock = Map.of();
+        cir.setReturnValue(attempt.plan());
     }
 }

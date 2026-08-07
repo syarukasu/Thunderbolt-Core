@@ -38,6 +38,7 @@ import appeng.api.networking.security.IActionSource;
 import appeng.api.stacks.AEKey;
 import appeng.crafting.CraftingCalculation;
 import appeng.crafting.CraftingLink;
+import appeng.crafting.CraftingPlan;
 import appeng.crafting.execution.CraftingSubmitResult;
 import appeng.me.cluster.implementations.CraftingCPUCluster;
 import appeng.me.service.CraftingService;
@@ -48,7 +49,6 @@ import com.moakiee.thunderbolt.ae2.crafting.ExtendedCraftingCpuCluster;
 import com.moakiee.thunderbolt.ae2.crafting.ExtendedCraftingCpuClusterProvider;
 import com.moakiee.thunderbolt.ae2.crafting.FastCraftingControl;
 import com.moakiee.thunderbolt.ae2.crafting.CraftingPlanningControl;
-import com.moakiee.thunderbolt.ae2.crafting.LoopCraftingPlan;
 import com.moakiee.thunderbolt.api.crafting.ICraftingPlanningService;
 
 @Mixin(value = CraftingService.class, remap = false)
@@ -206,7 +206,7 @@ public abstract class ExtendedCraftingCpuServiceMixin {
         }
 
         if (target instanceof ExtendedCraftingCpuCluster cluster) {
-            if (!cluster.canAcceptPlan(job)) {
+            if (!cluster.canHandle(job)) {
                 cir.setReturnValue(CraftingSubmitResult.CPU_OFFLINE);
             } else {
                 cir.setReturnValue(cluster.submitJob(this.grid, job, src, requestingMachine));
@@ -223,7 +223,7 @@ public abstract class ExtendedCraftingCpuServiceMixin {
             }
         }
 
-        if (thunderbolt$isPlanBound(job)) {
+        if (!(job instanceof CraftingPlan)) {
             if (target != null) {
                 cir.setReturnValue(CraftingSubmitResult.CPU_OFFLINE);
                 return;
@@ -255,7 +255,7 @@ public abstract class ExtendedCraftingCpuServiceMixin {
             CallbackInfoReturnable<ICraftingSubmitResult> cir,
             @Local CraftingCPUCluster cpuCluster,
             @Local MutableObject<UnsuitableCpus> unsuitableCpusResult) {
-        if (thunderbolt$isPlanBound(job)) {
+        if (!(job instanceof CraftingPlan)) {
             return;
         }
 
@@ -398,7 +398,7 @@ public abstract class ExtendedCraftingCpuServiceMixin {
                 tooSmall++;
                 continue;
             }
-            if (!cluster.canAcceptPlan(job)) {
+            if (!cluster.canHandle(job)) {
                 excluded++;
                 continue;
             }
@@ -434,11 +434,6 @@ public abstract class ExtendedCraftingCpuServiceMixin {
                 b.getAvailableStorage(),
                 prioritizePower));
         return valid.getFirst();
-    }
-
-    @Unique
-    private static boolean thunderbolt$isPlanBound(ICraftingPlan job) {
-        return job instanceof LoopCraftingPlan;
     }
 
     @Unique

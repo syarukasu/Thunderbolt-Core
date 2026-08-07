@@ -246,7 +246,7 @@ public final class TimeWheelCraftingCpuPool implements ExtendedCraftingCpuCluste
                                             ICraftingPlan plan,
                                             IActionSource src,
                                             @Nullable ICraftingRequester requester) {
-        if (!isActive() || !canAcceptPlan(plan)) {
+        if (!isActive() || !canHandle(plan)) {
             return CraftingSubmitResult.CPU_OFFLINE;
         }
 
@@ -282,11 +282,11 @@ public final class TimeWheelCraftingCpuPool implements ExtendedCraftingCpuCluste
     }
 
     @Override
-    public boolean canAcceptPlan(ICraftingPlan plan) {
+    public boolean canHandle(ICraftingPlan plan) {
         if (plan instanceof LoopCraftingPlan loopPlan) {
             return loopPlan.canRunOn(host);
         }
-        return ExtendedCraftingCpuCluster.super.canAcceptPlan(plan);
+        return ExtendedCraftingCpuCluster.super.canHandle(plan);
     }
 
     public void cancelAll() {

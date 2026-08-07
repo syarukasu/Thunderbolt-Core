@@ -270,3 +270,28 @@ Thunderbolt 不要求服务器启动时重新跑完整能力测试。能力声�
 - 超时预算、取消响应和异常路径。
 
 微小耗时差异不能覆盖正确性。玩家优先级也始终高于算法声明优先级。
+
+## 10. 计划与 CPU 兼容性
+
+算法返回的仍是 `ICraftingPlan`，实际运行时类型不会因为接口返回值而丢失。CPU 兼容性
+由扩展 CPU 自己声明，不维护“计划类型到 CPU 类型”的注册表：
+
+```java
+default boolean canHandle(ICraftingPlan plan) {
+    return plan instanceof CraftingPlan;
+}
+```
+
+路由规则如下：
+
+- `CraftingPlan` 可以提交给 AE2 原版 CPU；扩展 CPU 默认也接受；
+- 其他 `ICraftingPlan` 不能静默提交给原版 CPU，只能提交给 `canHandle(plan)` 返回
+  `true` 的扩展 CPU；
+- 玩家显式选择不兼容的 CPU 时直接拒绝，不自动替换成其他 CPU；
+- 自动选择时先过滤不兼容 CPU，再按来源偏好、协处理器和存储量排序；
+- 没有兼容 CPU 时明确返回不可提交结果，不把专用计划降级为普通计划。
+
+例如时间轮 CPU 可以额外接受带宿主约束的 `LoopCraftingPlan`，并在 `canHandle` 中继续
+检查具体宿主。普通第三方 CPU 若不覆盖该方法，只会得到与 AE2 原版一致的
+`CraftingPlan` 行为。网格节点仍需暴露扩展 CPU，使 CraftingService 能发现它；这只是
+CPU 实例发现机制，不是兼容性注册。

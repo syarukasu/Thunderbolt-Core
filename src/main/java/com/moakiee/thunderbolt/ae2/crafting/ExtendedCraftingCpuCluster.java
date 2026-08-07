@@ -70,8 +70,11 @@ public interface ExtendedCraftingCpuCluster extends ICraftingCPU {
     default void restoreCraftingLinks(Consumer<CraftingLink> consumer) {
     }
 
-    /** Whether this cluster accepts the plan in addition to normal capacity/selection checks. */
-    default boolean canAcceptPlan(ICraftingPlan plan) {
+    /**
+     * Whether this cluster can execute the plan in addition to normal capacity/selection checks.
+     * The default preserves AE2 behavior and only accepts its concrete {@code CraftingPlan}.
+    */
+    default boolean canHandle(ICraftingPlan plan) {
         return plan instanceof CraftingPlan;
     }
 
